@@ -380,7 +380,114 @@ The ContextMaterializationCoordinator executes it through the appropriate runtim
 
 ---
 
-# 12. Cross-Model Semantic Mapping
+# 12. Lookup Process — Block Chain Walk and Representation Resolution
+
+A single `FindContextResidency` call executes in two sequential phases.
+Phase 2 only runs if Phase 1 finds at least one matching block.
+
+---
+
+## Phase 1 — Block Chain Walk
+
+The shard receives the full set of canonical block keys `B0 ... Bn` upfront
+in `canonical_prefix_block_keys_ref`. It does not receive them one at a time.
+
+```text
+for i = 0, 1, 2, ... n:
+    probe shard index for Bi in model namespace
+    if HIT:  record match, continue
+    if MISS: stop
+```
+
+Each probe is a hash map lookup against the index entry:
+
+```text
+index entry:  Bi -> [residency_id, tier, node, epoch, physical_representation, confidence]
+```
+
+Walk stops at the first miss because of the chaining invariant: Bi encodes
+`H(B(i-1), tokens[i*block:(i+1)*block])`. A destination cannot use blocks
+B0..B(k-1) in GPU memory without the full unbroken prefix from B0.
+
+```text
+best case:   O(1)  — B0 not found, stop immediately (total miss)
+worst case:  O(n)  — all blocks found, full prefix reuse
+typical:     O(k)  — hits until the session-specific divergence point
+```
+
+Output of Phase 1: `matched_blocks = k` (zero if total miss).
+
+---
+
+## Phase 2 — Representation Resolution
+
+Runs only when `matched_blocks > 0`.
+
+For the matched block range `B0 ... B(k-1)`, the shard fetches all residencies
+that cover those blocks. Each residency carries a `physical_representation`
+(TP degree, layout, dtype, block size — the PhysicalKVRepresentation from section 3).
+
+The shard then compares every stored representation against every
+`target_physical_representations[i]` from the request.
+
+```text
+For each stored residency R with physical_representation Ps:
+
+    For each requested representation Pt in target_physical_representations:
+
+        if Ps == Pt:
+            -> PrefixResidencyMatch (direct hit, no transform needed)
+               add to longest_prefix_matches[]
+
+        elif transform(Ps -> Pt) is registered and supported:
+            -> ExactTransformOption (indirect hit, transform needed)
+               add to exact_transform_options[]
+               pick lowest-cost transform path if multiple source options exist
+
+        else:
+            -> skip (this residency is not useful for candidate replicas needing Pt)
+```
+
+A stored residency whose physical representation is not requested by any candidate
+and has no registered transform to any requested representation is silently excluded
+from the result.
+
+---
+
+## Result Assembly
+
+```text
+ContextResidencyResult {
+    longest_prefix_matches[]    <- one entry per (residency, direct-match candidate group)
+    exact_transform_options[]   <- one entry per (source residency, target representation)
+    index_version
+    observed_at
+}
+```
+
+Both fields are populated in one pass and returned together to Planner.
+The Planner uses `matched_tokens` and `estimated_transform_cost` to decide
+whether restoring and transforming beats fresh Prefill for each candidate.
+
+---
+
+## Relationship Between the Two Phases
+
+```text
+Phase 1  answers: HOW MUCH prefix is reusable?
+                  (block count, token count — same answer for all candidates)
+
+Phase 2  answers: WHO can use it, and at what transformation cost?
+                  (depends on each candidate's physical representation)
+```
+
+A full 30-block hit with a required TP reshard may lose to a 18-block hit with a
+direct match if the reshard cost exceeds the Prefill cost of the remaining 12 blocks.
+Planner has both numbers to make that decision.
+
+---
+
+# 13. Cross-Model Semantic Mapping
 
 Do not silently fold semantic mappers into exact transforms.
 
@@ -414,7 +521,7 @@ Base V5 may simply return no semantic-map options.
 
 ---
 
-# 13. Sharding
+# 14. Sharding
 
 The cardinality is huge.
 
@@ -434,7 +541,7 @@ The directory itself can maintain replicated metadata shards for availability, b
 
 ---
 
-# 14. Worker-Local and Tier Residency in One Result
+# 15. Worker-Local and Tier Residency in One Result
 
 Example:
 
@@ -473,7 +580,376 @@ This is why location must not be encoded as a binary hit/miss.
 
 ---
 
-# 15. Session Interaction
+# 16. End-to-End Lookup Example — Session Turn 3 Switching to Llama-70B
+
+This walks through a concrete lookup from the moment TargetModelContextMaterializer
+finishes through the result returned to Planner.
+
+**Scenario:** Multi-turn session S123. Turns 1 and 2 were served by Llama-3B.
+Phase 2 now selects Llama-70B for Turn 3 because the new question requires
+implementation-level depth. The Planner needs to know whether any Llama-70B
+KV already exists anywhere.
+
+---
+
+## 15.1 What TargetModelContextMaterializer Hands to Planner
+
+After applying the Llama-70B chat template and tokenizer the artifact contains:
+
+```text
+TargetModelContextArtifact {
+    model_revision         = "llama-70b-v3"
+    tokenizer_revision     = "tok-v7"
+    chat_template_revision = "llama3-chat-v2"
+
+    token_ids_ref          = "blob://tokens-req456"
+    input_token_count      = 480         <- turns 1+2 context + new user turn
+
+    token_context_digest   = "D_70b_full_turn3"
+}
+```
+
+The Planner derives canonical prefix block keys from those exact token IDs.
+Block size is determined by the ServingProfile of the candidate replicas (16 tokens here).
+
+---
+
+## 15.2 Canonical Prefix Block Key Derivation
+
+```text
+namespace = "llama-70b-v3 / tok-v7 / llama3-chat-v2 / hash-schema-v1"
+
+B0  = H(namespace, tokens[0:16])     <- system prompt tokens
+B1  = H(B0,        tokens[16:32])    <- still system prompt
+B2  = H(B1,        tokens[32:48])    <- start of user turn 1
+B3  = H(B2,        tokens[48:64])    <- assistant turn 1
+...
+B17 = H(B16,       tokens[272:288])  <- end of assistant turn 2
+B18 = H(B17,       tokens[288:304])  <- new user turn 3 begins
+...
+B29 = H(B28,       tokens[464:480])  <- end of user turn 3
+```
+
+Chaining is critical: B5 incorporates everything in B0..B4.
+A residency that has B3 but not B2 is unreachable and never reported.
+
+---
+
+## 15.3 Shard Routing
+
+The request routes to exactly one shard:
+
+```text
+shard_key = H(namespace, B0, B1)
+          -> KVDirectory Shard #42
+```
+
+`namespace` separates models: Llama-70B and Llama-3B never share a shard even
+with the same system prompt.
+
+`B0 + B1` represent the first 32 tokens — almost always the system prompt.
+All requests using the same model + same system prompt hash to Shard #42, so the
+directory can answer a full prefix-chain lookup without fanout to other shards.
+
+---
+
+## 15.4 FindContextResidency Request
+
+```text
+FindContextResidencyRequest {
+    request_id                      = "req-456"
+
+    logical_kv_identity = {
+        model_id                    = "llama"
+        model_revision              = "llama-70b-v3"
+        tokenizer_revision          = "tok-v7"
+        chat_template_revision      = "llama3-chat-v2"
+        target_context_digest       = "D_70b_full_turn3"
+        hash_schema_version         = "hash-schema-v1"
+    }
+
+    canonical_prefix_block_keys_ref = "blob://blocks-req456"   <- B0 ... B29
+    target_physical_representations = [TP4_NHD, TP2_HND]       <- what candidate D replicas use
+    candidate_compute_nodes         = [D7, D3, D9]
+    max_results                     = 5
+}
+```
+
+---
+
+## 15.5 Block Chain Walk Inside Shard #42
+
+Shard #42 walks the block chain starting from B0 in the Llama-70B namespace.
+
+**Case A — Total miss (our session; turns 1+2 were Llama-3B KV only)**
+
+```text
+B0 in llama-70b-v3 namespace -> NOT FOUND
+Stop. Longest continuous match = 0 blocks.
+```
+
+No further blocks are checked. A hit at B5 without B0 is meaningless because
+the first 16 tokens would be missing from the destination KV.
+
+**Case B — Partial hit (shared system prompt)**
+
+Suppose other requests have previously run Llama-70B with the same system prompt
+and their KV was checkpointed. The system prompt ends around block 3.
+
+```text
+B0 -> FOUND  D7 GPU  (from a different session, 2 hrs ago)
+B1 -> FOUND  D7 GPU
+B2 -> FOUND  D7 GPU
+B3 -> FOUND  D7 GPU  <- system prompt ends here
+B4 -> NOT FOUND      <- session-specific content diverges here
+Stop. Longest continuous match = 4 blocks = 64 tokens.
+```
+
+64 system-prompt tokens are reusable. The remaining 416 tokens need Prefill.
+
+**Case C — Full hit (Turn 4, same session, still Llama-70B)**
+
+After Turn 3 completes and its KV is checkpointed, the next turn's block chain
+shares B0..B29 exactly.
+
+```text
+B0  -> FOUND  D7 GPU
+B1  -> FOUND  D7 GPU
+...
+B29 -> FOUND  D7 GPU
+B30 -> NOT FOUND     <- Turn 4's new user tokens not yet computed
+Stop. Longest continuous match = 30 blocks = 480 tokens.
+```
+
+Entire prior context is reusable. Only Turn 4's new tokens need Prefill.
+
+---
+
+## 15.6 Result Returned to Planner
+
+**Case A result:**
+
+```text
+ContextResidencyResult {
+    request_id             = "req-456"
+    longest_prefix_matches = []     <- empty; no Llama-70B KV exists anywhere
+    exact_transform_options = []
+    index_version          = 8841
+    observed_at            = 2026-08-27T10:06:02Z
+}
+```
+
+Planner builds one candidate: `RECOMPUTE_P_THEN_D`, uncached_prefill_tokens = 480.
+
+**Case B result:**
+
+```text
+ContextResidencyResult {
+    longest_prefix_matches = [
+        PrefixResidencyMatch {
+            residency_id      = "res-D7-001"
+            matched_blocks    = 4
+            matched_tokens    = 64
+            tier              = WORKER_GPU
+            node_id           = "D7"
+            replica_epoch     = 12
+            physical_representation = TP4_NHD    <- direct match, no transform
+            confidence        = HIGH
+        }
+    ]
+}
+```
+
+Planner builds: `LOCAL_KV_REUSE(D7, 64 tokens) + Prefill 416 tokens`.
+
+**Case C result:**
+
+```text
+ContextResidencyResult {
+    longest_prefix_matches = [
+        PrefixResidencyMatch {
+            matched_blocks    = 30
+            matched_tokens    = 480
+            tier              = WORKER_GPU
+            node_id           = "D7"
+            confidence        = HIGH
+        }
+    ]
+}
+```
+
+Planner builds: `LOCAL_KV_REUSE(D7, 480 tokens)` — no Prefill needed,
+only Turn 4's new tokens appended.
+
+---
+
+## 15.7 Why the Directory Never Returns a Llama-3B Hit for a Llama-70B Request
+
+The `logical_kv_identity` carries `model_revision = "llama-70b-v3"`. The namespace
+embedded in B0 also encodes the model revision. Llama-3B KV lives under a different
+namespace and therefore on a different shard entirely. There is no code path that
+returns a 3B residency in response to a 70B lookup — the namespace mismatch makes
+them invisible to each other by construction.
+
+---
+
+## 15.8 Multi-Profile Residency Matching — Block Walk Then Representation Match
+
+The lookup is two sequential phases.
+Phase 1 finds the longest matching block prefix.
+Phase 2 matches the stored physical representations against what the candidate replicas need.
+
+**Setup — 5 candidate replicas for llama-70b-v3**
+
+Planner runs ReplicaDiscovery and ServingMetadataRegistry lookups first:
+
+```text
+Replica  serving_profile_id    KVCompatibilityProfile  -> PhysicalRepresentation
+──────── ─────────────────────────────────────────────────────────────────────────
+D1       sp-h100-tp4-fp8       kv-compat-001           -> P1 (TP4, NHD, fp8)
+D2       sp-h100-tp4-fp8       kv-compat-001           -> P1 (TP4, NHD, fp8)   <- same as D1
+D3       sp-h100-tp2-bf16      kv-compat-002           -> P2 (TP2, HND, bf16)
+D4       sp-a100-tp4-bf16      kv-compat-004           -> P4 (TP4, NHD, bf16)
+D5       sp-a100-tp2-fp8       kv-compat-005           -> P5 (TP2, HND, fp8)
+```
+
+D1 and D2 share the same KVCompatibilityProfile so they share the same physical
+representation P1. The request carries four distinct target representations:
+
+```text
+target_physical_representations = [P1, P2, P4, P5]
+```
+
+**Phase 1 — Block Chain Walk (same as 15.5)**
+
+The shard walks B0 → B17 and finds a continuous match.
+B18 is missing. Block walk stops.
+
+```text
+Longest matching prefix = 18 blocks = 288 tokens
+```
+
+**Phase 2 — Representation Matching for the 18-block prefix**
+
+The shard now asks: for the residencies that hold these 18 blocks,
+what physical representations are stored?
+
+```text
+Stored residencies for blocks B0..B17:
+
+res-A:  P1 (TP4, NHD, fp8)   on D7 GPU    <- written by a previous TP4 fp8 job
+res-B:  P2 (TP2, HND, bf16)  on CPU Node9  <- written by a previous TP2 bf16 job
+res-C:  P3 (TP2, NHD, bf16)  on NVMe Node4 <- written by yet another config
+```
+
+Three stored representations: P1, P2, P3.
+Four requested representations: P1, P2, P4, P5.
+
+**Match table:**
+
+```text
+Stored  Requested  Outcome
+──────  ─────────  ────────────────────────────────────────────────────────
+P1      P1         DIRECT HIT
+                   D1 and D2 can reuse res-A directly, no transform needed
+
+P2      P2         DIRECT HIT
+                   D3 can reuse res-B directly, no transform needed
+
+P3      —          IRRELEVANT
+                   No candidate replica uses P3; res-C is not reported
+
+P1->P4  P4         EXACT TRANSFORM CANDIDATE
+                   D4 needs TP4 NHD bf16. res-A has TP4 NHD fp8.
+                   Same TP degree and layout, only dtype differs (fp8->bf16).
+                   If a dequant/recast kernel is registered: ExactTransformOption.
+                   Estimated transform cost: low (dtype cast only, no reshard).
+
+P1->P5  P5         EXACT TRANSFORM CANDIDATE
+        or         D5 needs TP2 HND fp8. res-A has TP4 NHD fp8.
+P2->P5             TP reshard (4->2) + layout transpose (NHD->HND) required.
+                   res-B has TP2 HND bf16 — same shape, only dtype differs.
+                   P2->P5 transform is cheaper (dtype cast only).
+                   Directory reports the lower-cost transform path.
+```
+
+**Result returned to Planner:**
+
+```text
+ContextResidencyResult {
+    longest_prefix_matches = [
+
+        PrefixResidencyMatch {             <- direct hit for D1, D2
+            residency_id      = "res-A"
+            matched_blocks    = 18
+            matched_tokens    = 288
+            tier              = WORKER_GPU
+            node_id           = "D7"
+            replica_epoch     = 12
+            physical_representation = P1
+            confidence        = HIGH
+        },
+
+        PrefixResidencyMatch {             <- direct hit for D3
+            residency_id      = "res-B"
+            matched_blocks    = 18
+            matched_tokens    = 288
+            tier              = CPU_DRAM
+            node_id           = "Node9"
+            physical_representation = P2
+            confidence        = HIGH
+        }
+    ],
+
+    exact_transform_options = [
+
+        ExactTransformOption {             <- for D4 (needs P4)
+            source_residency_id   = "res-A"
+            target_representation = P4
+            transform_type        = DTYPE_CAST   <- fp8 -> bf16, same TP4 NHD layout
+            estimated_transform_bytes = 18 * 16 * model_dim * 2
+            estimated_transform_cost  = low
+            supported = true
+        },
+
+        ExactTransformOption {             <- for D5 (needs P5), cheaper path via res-B
+            source_residency_id   = "res-B"
+            target_representation = P5
+            transform_type        = DTYPE_CAST   <- bf16 -> fp8, same TP2 HND layout
+            estimated_transform_bytes = 18 * 16 * model_dim * 0.5
+            estimated_transform_cost  = low
+            supported = true
+        }
+    ]
+}
+```
+
+**What Planner does with this:**
+
+```text
+D1, D2  -> LOCAL_KV_REUSE(res-A, 288 tokens) + Prefill 192 tokens   no transform
+D3      -> RESTORE_CPU_KV(res-B, 288 tokens)  + Prefill 192 tokens   no transform
+D4      -> RESTORE + DTYPE_CAST(res-A->P4)    + Prefill 192 tokens   cheap transform
+D5      -> RESTORE + DTYPE_CAST(res-B->P5)    + Prefill 192 tokens   cheaper than res-A path
+```
+
+P3 (res-C on NVMe) is never surfaced — no candidate replica requested it
+so the directory silently excludes it from the result.
+
+**Key rule:**
+
+```text
+Phase 1  (block walk)        answers: HOW MUCH prefix is reusable?
+Phase 2  (representation match) answers: WHO can use it, and at what transform cost?
+```
+
+These two phases compose. A 30-block full hit with a required TP reshard may be
+worse than a 18-block hit with a direct match, depending on transform cost vs
+Prefill cost. Planner has both numbers to make that call.
+
+---
+
+# 17. Session Interaction
 
 The SessionStore does not query this index directly.
 
@@ -494,7 +970,7 @@ The index may reveal a residency that originated from an earlier turn of that sa
 
 ---
 
-# 16. Race Boundary
+# 18. Race Boundary
 
 Directory metadata is not a reservation.
 
@@ -534,7 +1010,7 @@ execution-time guarantee
 
 ---
 
-# 17. Failure Semantics
+# 19. Failure Semantics
 
 Directory unavailable:
 
@@ -566,7 +1042,7 @@ No session correctness is lost.
 
 ---
 
-# 18. Design Principles
+# 20. Design Principles
 
 1. Index metadata, not KV bytes.
 2. Index exact target-model prefix identity, not raw text.
@@ -583,6 +1059,6 @@ No session correctness is lost.
 
 ---
 
-# 19. Interview Answer
+# 21. Interview Answer
 
 > **I evolve the old PreciseKVIndex into a KVDirectoryIndex once KV can live outside model replicas. Its key abstraction is a logical KV identity—exact model revision plus exact target-token prefix—and each logical KV can have multiple physical residencies: worker GPU, shared GPU, CPU DRAM or NVMe, potentially in different TP/layout representations. The directory stores metadata and transform availability, not bytes. The Planner uses it to enumerate materialization paths, while the ContextMaterializationCoordinator later performs a JIT source/version validation before restoring or transferring. That keeps cache discovery fast without making stale metadata a correctness dependency.**

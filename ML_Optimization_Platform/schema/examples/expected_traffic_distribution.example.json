@@ -1,0 +1,228 @@
+{
+  "schema_version": 1,
+  "traffic_distribution_id": "feed-gen-online-traffic",
+  "version": 12,
+  "model_registry_path": "registry://feed-ai/feed-gen/versions/42",
+  "serving_requirements_ref": "registry://feed-ai/feed-gen/versions/42/serving-requirements/7",
+  "provenance": {
+    "source": "HISTORICAL_FORECAST",
+    "source_window_start": "2026-08-01T00:00:00Z",
+    "source_window_end": "2026-08-14T23:59:59Z",
+    "generated_at": "2026-08-16T18:00:00Z",
+    "generator_version": "feed-traffic-profiler-v3",
+    "forecast_scenario": "2026-q4-launch-forecast"
+  },
+  "online": {
+    "steady_state_qps": 3500,
+    "p95_one_minute_qps": 7000,
+    "peak_one_minute_qps": 10000,
+    "max_expected_peak_duration": "120s",
+    "client_concurrency": {
+      "p50": 1200,
+      "p95": 2800,
+      "p99": 3900
+    }
+  },
+  "segments": [
+    {
+      "name": "short_interactive",
+      "request_fraction": 0.6,
+      "input_tokens": {
+        "buckets": [
+          {
+            "min_tokens": 1,
+            "max_tokens": 512,
+            "probability": 0.25
+          },
+          {
+            "min_tokens": 513,
+            "max_tokens": 1024,
+            "probability": 0.4
+          },
+          {
+            "min_tokens": 1025,
+            "max_tokens": 2048,
+            "probability": 0.25
+          },
+          {
+            "min_tokens": 2049,
+            "max_tokens": 4096,
+            "probability": 0.1
+          }
+        ]
+      },
+      "output_tokens": {
+        "buckets": [
+          {
+            "min_tokens": 1,
+            "max_tokens": 128,
+            "probability": 0.3
+          },
+          {
+            "min_tokens": 129,
+            "max_tokens": 256,
+            "probability": 0.5
+          },
+          {
+            "min_tokens": 257,
+            "max_tokens": 512,
+            "probability": 0.2
+          }
+        ]
+      },
+      "streaming_fraction": 1.0,
+      "prefix_reuse": {
+        "reusable_request_fraction": 0.1,
+        "shared_prefix_tokens": {
+          "buckets": [
+            {
+              "min_tokens": 128,
+              "max_tokens": 512,
+              "probability": 0.7
+            },
+            {
+              "min_tokens": 513,
+              "max_tokens": 1024,
+              "probability": 0.3
+            }
+          ]
+        },
+        "average_reuses_per_prefix": 2.5,
+        "typical_reuse_window": "10s"
+      },
+      "service_class": "INTERACTIVE"
+    },
+    {
+      "name": "medium_context",
+      "request_fraction": 0.3,
+      "input_tokens": {
+        "buckets": [
+          {
+            "min_tokens": 4097,
+            "max_tokens": 8192,
+            "probability": 0.35
+          },
+          {
+            "min_tokens": 8193,
+            "max_tokens": 12288,
+            "probability": 0.4
+          },
+          {
+            "min_tokens": 12289,
+            "max_tokens": 16384,
+            "probability": 0.25
+          }
+        ]
+      },
+      "output_tokens": {
+        "buckets": [
+          {
+            "min_tokens": 1,
+            "max_tokens": 256,
+            "probability": 0.3
+          },
+          {
+            "min_tokens": 257,
+            "max_tokens": 512,
+            "probability": 0.5
+          },
+          {
+            "min_tokens": 513,
+            "max_tokens": 1024,
+            "probability": 0.2
+          }
+        ]
+      },
+      "streaming_fraction": 1.0,
+      "prefix_reuse": {
+        "reusable_request_fraction": 0.25,
+        "shared_prefix_tokens": {
+          "buckets": [
+            {
+              "min_tokens": 512,
+              "max_tokens": 2048,
+              "probability": 0.6
+            },
+            {
+              "min_tokens": 2049,
+              "max_tokens": 4096,
+              "probability": 0.4
+            }
+          ]
+        },
+        "average_reuses_per_prefix": 4.0,
+        "typical_reuse_window": "20s"
+      },
+      "service_class": "INTERACTIVE"
+    },
+    {
+      "name": "long_context",
+      "request_fraction": 0.1,
+      "input_tokens": {
+        "buckets": [
+          {
+            "min_tokens": 16385,
+            "max_tokens": 32768,
+            "probability": 0.35
+          },
+          {
+            "min_tokens": 32769,
+            "max_tokens": 65536,
+            "probability": 0.4
+          },
+          {
+            "min_tokens": 65537,
+            "max_tokens": 131072,
+            "probability": 0.25
+          }
+        ]
+      },
+      "output_tokens": {
+        "buckets": [
+          {
+            "min_tokens": 1,
+            "max_tokens": 512,
+            "probability": 0.3
+          },
+          {
+            "min_tokens": 513,
+            "max_tokens": 1024,
+            "probability": 0.4
+          },
+          {
+            "min_tokens": 1025,
+            "max_tokens": 4096,
+            "probability": 0.3
+          }
+        ]
+      },
+      "streaming_fraction": 1.0,
+      "prefix_reuse": {
+        "reusable_request_fraction": 0.4,
+        "shared_prefix_tokens": {
+          "buckets": [
+            {
+              "min_tokens": 2048,
+              "max_tokens": 8192,
+              "probability": 0.5
+            },
+            {
+              "min_tokens": 8193,
+              "max_tokens": 16384,
+              "probability": 0.3
+            },
+            {
+              "min_tokens": 16385,
+              "max_tokens": 32768,
+              "probability": 0.2
+            }
+          ]
+        },
+        "average_reuses_per_prefix": 6.5,
+        "typical_reuse_window": "30s"
+      },
+      "service_class": "INTERACTIVE"
+    }
+  ],
+  "representative_trace_ref": "traffic-store://feed-gen/expected/v12/sample-1m-requests"
+}

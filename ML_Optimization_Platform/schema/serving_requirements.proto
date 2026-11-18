@@ -1,0 +1,386 @@
+syntax = "proto3";
+
+package linkedin.ai.modeloptimization.v1;
+
+import "google/protobuf/duration.proto";
+
+// ============================================================================
+// ServingRequirements
+//
+// Producer:
+//   AI / product team that owns the workload, e.g. Feed AI.
+//
+// Primary consumers:
+//   1. Capability filtering / routing:
+//      Uses model capabilities and workload semantics to determine whether
+//      a model/serving profile can satisfy a request class.
+//   2. Resource policy / scheduling:
+//      Uses model identity to resolve tenant ownership, quota, priority
+//      policy, and accounting scope. The artifact carries identity; the
+//      authoritative quota amount remains in the resource-policy system.
+//   3. Model Optimization Platform:
+//      Uses functional requirements, performance SLOs, and quality gates to
+//      prune candidates, design experiments, and qualify ServingProfiles.
+//   4. Online / Offline Serving Platforms:
+//      Uses functional requirements and serving SLOs for deployment,
+//      admission, capacity planning, routing, and runtime SLO enforcement.
+//
+// Lifecycle:
+//   Immutable and versioned. Updating any requirement creates a new version.
+//   An OptimizationJob pins one exact ServingRequirements version.
+//
+// Important boundary:
+//   This artifact describes what the workload REQUIRES.
+//   Intrinsic facts about the canonical model itself (architecture, hidden
+//   size, number of layers, native tokenizer, weight dtype, etc.) belong to
+//   CanonicalModel / ModelBundle metadata.
+//   This artifact may reference that model contract, and separately declares
+//   the capabilities the workload requires.
+// ============================================================================
+message ServingRequirements {
+  // Schema version for backward-compatible decoding.
+  // Example: 1
+  uint32 schema_version = 1;
+
+  // Stable logical identifier for this requirement set across revisions.
+  // Example: "feed-gen-online"
+  string requirements_id = 2;
+
+  // Immutable revision number of this requirement set.
+  // Example: 7
+  uint64 version = 3;
+
+  // Identifies the product workload and organizational ownership.
+  // Used for discovery, policy lookup, quota-account resolution, auditing,
+  // and grouping related optimization/serving activity.
+  ModelIdentity model_identity = 4;
+
+  // Reference to the canonical model contract this requirement set targets.
+  // This avoids copying intrinsic model metadata into this artifact.
+  // Example: "registry://feed-ai/feed-gen/versions/42/model-contract"
+  string canonical_model_contract_ref = 5;
+
+  // Declares semantic capabilities the workload expects from a serving
+  // realization. Capability filtering compares these requirements against
+  // capabilities advertised by a model / ServingProfile.
+  ModelCapabilities model_capabilities = 6;
+
+  // Hard serving behavior that a qualified ServingProfile must support.
+  ServingBounds serving_bounds = 7;
+
+  // Latency and throughput objectives used by BOTH Model Optimization and
+  // Serving. Optimization uses them for qualification; Serving uses them for
+  // capacity planning, admission, routing, and SLO monitoring.
+  ServingSloRequirements serving_slo_requirements = 8;
+
+  // Quality constraints used primarily by Model Optimization /
+  // Qualification to decide whether transformations such as quantization or
+  // compilation preserve acceptable model behavior.
+  QualityRequirements quality_requirements = 9;
+}
+
+
+// ============================================================================
+// ModelIdentity
+//
+// Producer:
+//   AI / product team.
+//
+// Consumers:
+//   Model Registry search, Optimization Platform, Serving Platform,
+//   Resource Policy / GPU Scheduler, compliance and cost-accounting systems.
+//
+// Purpose:
+//   Identify WHO owns this workload and WHAT product use case it represents.
+//   This is policy lookup input, not the authoritative quota configuration.
+//
+// Lifecycle:
+//   Immutable as part of a ServingRequirements version.
+// ============================================================================
+message ModelIdentity {
+  // Stable organization / tenant identifier.
+  // Example: "feed-ai"
+  string organization = 1;
+
+  // Stable workload or product use-case identifier.
+  // Example: "feed-generation"
+  string use_case = 2;
+
+  // Environment / deployment class.
+  // Example: "production"
+  string environment = 3;
+
+  // Human or service ownership identifier used for operational routing.
+  // Example: "feed-ml-infra"
+  string owner = 4;
+
+  // Accounting / tenant scope resolved by policy systems to GPU quota,
+  // chargeback, and fairness configuration.
+  // Example: "feed"
+  //
+  // NOTE: this names the scope; it does NOT encode "Feed gets 512 GPUs".
+  string resource_scope = 5;
+
+  // Optional searchable labels for discovery and reporting.
+  // Example: {"product":"feed", "tier":"member-facing"}
+  map<string, string> labels = 6;
+}
+
+
+// ============================================================================
+// ModelCapabilities
+//
+// Producer:
+//   AI / product team.
+//
+// Consumers:
+//   Capability-filtering stage in routing and Model Optimization feasibility
+//   pruning.
+//
+// Purpose:
+//   Describe semantic/model-interface capabilities required by the workload.
+//   These are requirements, not an intrinsic description of the model.
+//
+// Lifecycle:
+//   Immutable as part of a ServingRequirements version.
+// ============================================================================
+message ModelCapabilities {
+  // Primary operation required by the workload.
+  // Example: TEXT_GENERATION
+  ModelOperation operation = 1;
+
+  // Accepted logical input modalities.
+  // Example: [TEXT]
+  repeated Modality input_modalities = 2;
+
+  // Required output modalities.
+  // Example: [TEXT]
+  repeated Modality output_modalities = 3;
+
+  // Whether token streaming must be supported.
+  // Example: true for interactive generation.
+  bool streaming_required = 4;
+
+  // Optional required model-family compatibility.
+  // Prefer capability-based filtering over family-name filtering.
+  // Example: ["llama"]
+  repeated string allowed_model_families = 5;
+
+  // Additional named capabilities required from the serving realization.
+  // Example: ["logprobs", "tool_calling"]
+  repeated string required_features = 6;
+}
+
+
+// ============================================================================
+// ServingBounds
+//
+// Producer:
+//   AI / product team.
+//
+// Consumers:
+//   Model Optimization feasibility pruning and Qualification;
+//   Online/Offline Serving deployment validation.
+//
+// Purpose:
+//   Declare hard functional limits the serving realization must support.
+//
+// Lifecycle:
+//   Immutable as part of a ServingRequirements version.
+// ============================================================================
+message ServingBounds {
+  // Maximum total context window required by the workload, including prompt
+  // plus generated tokens.
+  // Example: 131072
+  uint32 max_context_tokens = 1;
+
+  // Maximum generated output length the product may request.
+  // Example: 4096
+  uint32 max_output_tokens = 2;
+
+  // Minimum input length that must be supported.
+  // Example: 1
+  uint32 min_input_tokens = 3;
+
+  // Whether requests may contain multiple independent samples/prompts in one
+  // API request.
+  // Example: false for interactive generation.
+  bool multi_sample_request_required = 4;
+}
+
+
+// ============================================================================
+// ServingSloRequirements
+//
+// Producer:
+//   AI / product team, typically with serving/platform guidance.
+//
+// Consumers:
+//   Model Optimization Platform:
+//     candidate pruning, benchmark planning, final qualification.
+//   Serving Platform:
+//     capacity planning, autoscaling policy, routing, admission, SLO alerts.
+//
+// Purpose:
+//   Define externally meaningful serving objectives.
+//
+// Lifecycle:
+//   Immutable as part of a ServingRequirements version.
+// ============================================================================
+message ServingSloRequirements {
+  // Time-to-first-token requirement for streaming generation.
+  // Leave unset for workloads where TTFT is not meaningful.
+  PercentileLatencySlo ttft = 1;
+
+  // Inter-token latency / time-per-output-token requirement.
+  // Leave unset for non-generative workloads.
+  PercentileLatencySlo tpot = 2;
+
+  // Optional end-to-end request latency objective.
+  PercentileLatencySlo end_to_end_latency = 3;
+
+  // Minimum sustained input-token throughput expected from a qualified
+  // deployment unit/profile under the benchmark workload.
+  // Example: 25000 tokens/sec.
+  double minimum_input_tokens_per_second = 4;
+
+  // Minimum sustained output-token throughput expected from a qualified
+  // deployment unit/profile under the benchmark workload.
+  // Example: 1500 tokens/sec.
+  double minimum_output_tokens_per_second = 5;
+
+  // Maximum acceptable failed-request fraction under the qualification load.
+  // Example: 0.001 means <= 0.1%.
+  double maximum_error_rate = 6;
+}
+
+
+// ============================================================================
+// PercentileLatencySlo
+//
+// Producer:
+//   Embedded by the AI / product team in ServingSloRequirements.
+//
+// Consumers:
+//   Optimization benchmark/qualification and Serving SLO enforcement.
+//
+// Purpose:
+//   Represent a percentile-based latency objective precisely.
+//
+// Lifecycle:
+//   Immutable as part of a ServingRequirements version.
+// ============================================================================
+message PercentileLatencySlo {
+  // Percentile on the [0, 100] scale.
+  // Example: 99.0
+  double percentile = 1;
+
+  // Maximum allowed latency at the specified percentile.
+  // Example: 0.800s for p99 TTFT <= 800 ms.
+  google.protobuf.Duration maximum_latency = 2;
+}
+
+
+// ============================================================================
+// QualityRequirements
+//
+// Producer:
+//   AI / product/model team.
+//
+// Consumers:
+//   Primarily Model Optimization Platform and QualificationController.
+//
+// Purpose:
+//   Bound acceptable semantic-quality regression caused by serving
+//   transformations such as quantization or other optimization techniques.
+//
+// Lifecycle:
+//   Immutable as part of a ServingRequirements version.
+// ============================================================================
+message QualityRequirements {
+  // Versioned evaluation suite used for candidate qualification.
+  // Example: "eval-registry://feed-gen/serving-quality/v5"
+  string evaluation_suite_ref = 1;
+
+  // Baseline result produced by the canonical model before serving-specific
+  // optimization.
+  // Example: "eval-registry://feed-gen/model-v42/baseline"
+  string baseline_result_ref = 2;
+
+  // Every gate must pass for a candidate to qualify.
+  repeated QualityGate gates = 3;
+}
+
+
+// ============================================================================
+// QualityGate
+//
+// Producer:
+//   AI / product/model team.
+//
+// Consumers:
+//   QualificationController.
+//
+// Purpose:
+//   Express one hard quality acceptance criterion.
+//
+// Lifecycle:
+//   Immutable as part of QualityRequirements.
+// ============================================================================
+message QualityGate {
+  // Metric emitted by the referenced evaluation suite.
+  // Example: "task_quality_score"
+  string metric = 1;
+
+  // Acceptance rule. Exactly one branch should be set.
+  oneof rule {
+    // Maximum fractional regression from canonical-model baseline.
+    // Example: 0.005 means <= 0.5% relative degradation.
+    double max_relative_regression = 2;
+
+    // Minimum absolute metric value.
+    // Example: 0.97
+    double minimum_value = 3;
+
+    // Maximum absolute metric value for metrics where lower is better.
+    // Example: 0.02
+    double maximum_value = 4;
+  }
+
+  // Optional named evaluation slice.
+  // Example: "english_long_context"
+  string slice = 5;
+}
+
+
+// ============================================================================
+// ModelOperation
+// ============================================================================
+enum ModelOperation {
+  MODEL_OPERATION_UNSPECIFIED = 0;
+
+  // Autoregressive or sequence text generation.
+  TEXT_GENERATION = 1;
+
+  // Dense/sparse embedding generation.
+  EMBEDDING = 2;
+
+  // Classification / scoring workloads.
+  CLASSIFICATION = 3;
+
+  // General multimodal generation or understanding.
+  MULTIMODAL = 4;
+}
+
+
+// ============================================================================
+// Modality
+// ============================================================================
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+
+  TEXT = 1;
+  IMAGE = 2;
+  VIDEO = 3;
+  AUDIO = 4;
+}
